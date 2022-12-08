@@ -1,352 +1,535 @@
+import os
 import pandas as pd
 import numpy as np
-import os
-from sklearn.model_selection import train_test_split
-np.random.seed(7)
 
-# My env module
-import src.env as env
-
-
-# turn off pink warning boxes
+# ignore warnings
 import warnings
 warnings.filterwarnings("ignore")
 
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
+
+from sklearn.feature_selection import SelectKBest, RFE, f_regression
+from sklearn.linear_model import LinearRegression
+
+import src.env as env
+
+########## GLOBAL VARIABLES ##########
+
+# random state seed
+seed = 42
+
+# target variable for modeling
+target = 'logerror'
+
+# sql query to get the data
+#Create the SQL query
+query = '''
+        SELECT prop.*,
+        predictions_2017.logerror,
+        predictions_2017.transactiondate,
+        air.airconditioningdesc,
+        arch.architecturalstyledesc,
+        build.buildingclassdesc,
+        heat.heatingorsystemdesc,
+        land.propertylandusedesc,
+        story.storydesc,
+        type.typeconstructiondesc
+        FROM properties_2017 prop
+        JOIN (
+            SELECT parcelid, MAX(transactiondate) AS max_transactiondate
+            FROM predictions_2017
+            GROUP BY parcelid
+            ) pred USING(parcelid)
+        JOIN predictions_2017 ON pred.parcelid = predictions_2017.parcelid
+                          AND pred.max_transactiondate = predictions_2017.transactiondate
+        LEFT JOIN airconditioningtype air USING(airconditioningtypeid)
+        LEFT JOIN architecturalstyletype arch USING(architecturalstyletypeid)
+        LEFT JOIN buildingclasstype build USING(buildingclasstypeid)
+        LEFT JOIN heatingorsystemtype heat USING(heatingorsystemtypeid)
+        LEFT JOIN propertylandusetype land USING(propertylandusetypeid)
+        LEFT JOIN storytype story USING(storytypeid)
+        LEFT JOIN typeconstructiontype type USING(typeconstructiontypeid)
+        WHERE propertylandusedesc = "Single Family Residential"
+            AND transactiondate <= '2017-12-31'
+            AND prop.longitude IS NOT NULL
+            AND prop.latitude IS NOT NULL
+        '''
 
 ##############################################################
   ##############       Primary Function       ##############
 #######  Creates, cleans dataframe, returns dataframe  #######
 ##############################################################
 
-def zillow_2017(simple = True, small = False):
+def get_zillow(explore=True):
     '''
-    This is a very large dataset and the values can get very wide so we will handle 
-    null values by dropping them. The process will be to first turn whitespace into 
-    null values and then drop rows with null values from columns 
-    which we find to be important.  
-    '''
-
-    if simple == True:
-        # checks to see if wrangled zillow data exists already
-        # if it does, then fills df with the stored data
-        # retains "small" variable option
-        if os.path.isfile('data/simple_wrangled_zillow_2017.csv'):
-
-            df = pd.read_csv('data/simple_wrangled_zillow_2017.csv', index_col=0)
-
-            if small == True:
-                df = df.sample(frac=0.5)
-
-            return df
-
-        else:
-            df = simple_sql_zillow_2017()
-
-        # calls function to clean dirty data
-        df = cleaning(df)
-    
-        # if a smaller sized sample of the data is sought to be used to conserve computational resources,
-        # the small variable can be modified to cut the dataframe down to half its original size
-        if small == True:
-            df = df.sample(frac=0.5)
-
-        # Cache data so future runs of this program go by more quickly
-        df.to_csv('data/simple_wrangled_zillow_2017.csv')
-
-
-        return df 
-
-
-    if simple == False:
-        # checks to see if wrangled zillow data exists already
-        # if it does, then fills df with the stored data
-        # retains "small" variable option
-        if os.path.isfile('data/complex_wrangled_zillow_2017.csv'):
-
-            df = pd.read_csv('data/complex_wrangled_zillow_2017.csv', index_col=0)
-
-            if small == True:
-                df = df.sample(frac=0.5)
-
-            return df
-
-        else:
-            df = complex_sql_zillow_2017()
-
-        # calls function to clean dirty data
-        df = cleaning(df, simple=False)
-        df['squared_sq_feet'] = df['sq_feet']*df['sq_feet']
-        df= df.drop(columns = 'sq_feet')
-        # if a smaller sized sample of the data is sought to be used to conserve computational resources,
-        # the small variable can be modified to cut the dataframe down to half its original size
-        if small == True:
-            df = df.sample(frac=0.5)
-
-        # Cache data so future runs of this program go by more quickly
-        df.to_csv('data/complex_wrangled_zillow_2017.csv')
-
-
-        return df 
-
-
-
-########################################
-###### 2 SQL Queries for Server ########
-########################################
-
-########     Complex Query     ########
-
-def complex_sql_zillow_2017():
-    '''
-    This function passes a SQL query for specified columns, converts 
-    that into a pandas dataframe and then returns that dataframe
+    acquires the data from zillow database
+    cleans and prepares the data for the exploration
+    returns a zillow data frame ready to split
     '''
 
-    sql_query = '''
-    SELECT taxvaluedollarcnt, bedroomcnt, calculatedbathnbr, 
-    calculatedfinishedsquarefeet, lotsizesquarefeet, yearbuilt, fips
-    FROM properties_2017 AS prop
+    df = acquire_zillow()
 
-    JOIN predictions_2017 AS pred ON prop.parcelid = pred.parcelid
-        AND pred.transactiondate >= '2017-01-01'
+    if explore == True:
 
-    WHERE prop.bedroomcnt > 0
-        AND prop.calculatedbathnbr >0
-        AND prop.propertylandusetypeid = '261'
-    ''' 
-    
-    # reads the returned data tables into a dataframe
-    df = pd.read_sql(sql_query, env.codeup_db('zillow'))
+        df = cleaning(df, explore=True)
 
+    else: 
+
+        df = cleaning(df, explore=False)
     
-    # Cache data
-    df.to_csv('data/complex_zillow_2017.csv')
-    
+
+    filename = 'clean_zillow.csv'
+    df.to_csv(filename, index_label = False)
+
     return df
 
 
-########     Simple Query     ##########
+#######       Acquire Zillow Data       #######
 
-def simple_sql_zillow_2017():
+def acquire_zillow():
     '''
-    This function passes a SQL query for specified columns, converts 
-    that into a pandas dataframe and then returns that dataframe
+    acuires data from codeup data base
+    returns a pandas dataframe with
+    'Single Family Residential' properties of 2017
+    from zillow
     '''
-
-    sql_query = '''
-    SELECT taxvaluedollarcnt, bedroomcnt, bathroomcnt, calculatedfinishedsquarefeet, fips
-    FROM properties_2017 AS prop
-
-    JOIN predictions_2017 AS pred ON prop.parcelid = pred.parcelid
-        AND pred.transactiondate >= '2017-01-01'
-
-    WHERE prop.bedroomcnt > 0
-        AND prop.bathroomcnt >0
-        AND prop.propertylandusetypeid = '261'
-    ''' 
     
-    # reads the returned data tables into a dataframe
-    df = pd.read_sql(sql_query, env.codeup_db('zillow'))
+    filename = 'zillow.csv'
+
+    url = env.get_db_url('zillow')
     
-    # Cache data
-    df.to_csv('data/simple_zillow_2017.csv')
+    # if csv file is available locally, read data from it
+    if os.path.isfile(filename):
+        df = pd.read_csv(filename) 
     
+    # if *.csv file is not available locally, acquire data from SQL database
+    # and write it as *.csv for future use
+    else:
+        # read the SQL query into a dataframe
+        df =  pd.read_sql(query, url)
+        
+        # Write that dataframe to disk for later. Called "caching" the data for later.
+        df.to_csv(filename, index_label = False)
+        
     return df
+
+'''    
+    df = acquire_zillow()
+    clean_from_ids(df)
+    fill_nulls(df)
+    drop_nulls(df)
+    df = handle_outliers(df)
+    df = transform_columns(df)
+    df = engineering(df)
+    '''
+#######################################################
+#######        calls  cleaning functions        #######
+#######################################################
+
+def cleaning(df, explore=True):
+    # runs functions defined earlier in program which clean up dataframe    
+    if explore==True:
+        df = clean_from_ids(df)
+        df = rename_columns(df)
+        df = fill_nulls(df)
+        df = drop_nulls(df)
+        df = handle_outliers(df)
+        df = transform_columns(df)
+        df = engineering(df)
+
+    else:
+        df = clean_from_ids(df)
+        df = rename_columns(df, explore=False)
+        df = fill_nulls(df, explore=False)
+        df = drop_nulls(df)
+        df = handle_outliers(df, explore=False)
+        df = transform_columns(df, explore=False)
+        df = engineering(df, explore=False)
+
+    return df 
+
+
 
 
 ####################################################
 #######     Functions to clean dataframe     #######
 ####################################################
 
+#######       clean id off column names      #######
+
+def clean_from_ids(df):
+    '''
+    the function accepts a dataframe as a parameter
+    goes through all columns and removes the ones 
+    that end with id
+    total: 14 rows with ids were removed
+    '''
+    #df.drop(columns=['id', 'parcelid'], inplace=True)
+    
+    # drop the columns that consist only of null values
+    for col in df.columns.tolist():
+        if df[col].isna().sum() == df.shape[0]:
+            df.drop(columns=col, inplace=True)
+    # based on value_counts() i would keep buildingqualitytypeid and heatingorsystemtypeid
+
+    # rename those columns to remove id from their name
+   # df.rename(columns={'buildingqualitytypeid':'building_quality_type', 
+               # 'heatingorsystemtypeid':'heating_system_type'}, inplace=True)
+    # remove columns that are  different ids
+    columns = []
+    for col in df.columns.tolist():
+        if col.endswith('id'):
+            columns.append(col)
+    df.drop(columns=columns, inplace=True)
+
+    return df 
+
 ############       rename columns       ############
 
-def rename_columns(df, simple=True):
-    
-    if simple == True:
-        df = df.rename(columns={'bedroomcnt':'bedrooms', 
-                                'bathroomcnt':'baths', 
-                                'calculatedfinishedsquarefeet':'sq_feet', 
-                                'taxvaluedollarcnt':'tax_value'})
-        
-    
-    
-    else:
-        df = df.rename(columns={'bedroomcnt':'bedrooms', 
-                                #'bathroomcnt':'baths', 
-                                'calculatedfinishedsquarefeet':'sq_feet', 
-                                'yearbuilt':'year_built',
-                                'taxvaluedollarcnt':'tax_value',
-                                'calculatedbathnbr':'bath_adv',
-                                'lotsizesquarefeet':'lot_size'                               
-                                })
-        
+def rename_columns(df, explore=True):
 
-    return df 
+    if explore==True:
 
+        df.rename(columns={
+                'calculatedfinishedsquarefeet':'sqft',
+                'bathroomcnt':'bath',
+                'bedroomcnt':'beds',
+                'fireplacecnt':'fireplace',
+                'fullbathcnt':'fullbath',
+                'garagecarcnt':'garage',
+                'garagetotalsqft':'garage_sqft',
+                'hashottuborspa':'hottub_spa',
+                'lotsizesquarefeet': 'lot_sqft',
+                'poolcnt':'pool',
+                'pooltypeid10':'pool_10',
+                'pooltypeid2':'pool_2',
+                'pooltypeid7':'pool_7',
+                'propertycountylandusecode':'county_land_code',
+                'regionidcity':'city_id',
+                'regionidzip':'zip',
+                'unitcnt':'unit',
+                'yearbuilt':'year_built',
+                'structuretaxvaluedollarcnt':'structure_price',
+                'taxvaluedollarcnt':'price',
+                'landtaxvaluedollarcnt':'land_price',
+                'taxamount':'tax_amount',
+                }, inplace=True)
 
-############       handling outliers       ############
-
-def handle_outliers(df, simple=True):
-    """Manually handle outliers that do not represent properties likely 
-    for 91% of properties that buyers may be looking at
-    """
-
-    if simple==True:
-        high_bed_bool = df['bedrooms'] <= 5 
-        low_bed_bool  = df['bedrooms'] > 1
-        bathroom_bool = df['baths'] <= 4
-        sq_feet_bool = df['sq_feet'] < 6000
-        high_tax_bool = df['tax_value'] < 1557580
-        low_tax_bool = df['tax_value'] > 6000
-
-
-        df = df[high_bed_bool & low_bed_bool]
-        df = df[high_tax_bool & low_tax_bool]
-        df = df[bathroom_bool]
-        df = df[sq_feet_bool]
-
-
-    else:
-        high_bed_bool = df['bedrooms'] <= 5 
-        low_bed_bool  = df['bedrooms'] > 1
-        sq_feet_bool = df['sq_feet'] < 6000
-        bathroom_bool2 = df['bath_adv'] <= 4.5
-        high_lot_size_bool = df['lot_size'] < 6000000
-        low_lot_size_bool = df['lot_size'] > 750
-        low_year_built_bool = df['year_built'] > 1915
-        high_tax_bool = df['tax_value'] < 1557580
-        low_tax_bool = df['tax_value'] > 6000
-
-
-        df = df[high_bed_bool & low_bed_bool]
-        df = df[high_tax_bool & low_tax_bool]
-        df = df[sq_feet_bool]
-        df = df[bathroom_bool2]
-        df = df[low_year_built_bool]
-        df = df[high_lot_size_bool & low_lot_size_bool]
-
-
-    #df = df[df.bedrooms <= 6]
-    #df = df[df.baths <= 6]
-    #df = df[df.tax_value < 2_000_000]
-    #df = df[df.sq_feet < 10000]
 
     return df
 
 
-############       handling naans       ############
+#######       fill null values in df      #######
 
-def deal_with_nulls(df, simple=True):
-
-    # fills whitespace will Naans
-    df = df.replace(r'^\s*s', np.NaN, regex=True)
-
-    # the columns which we want to drop naan values from
-    #naan_drop_columns = ['sq_feet', 'tax_value', 'year_built', 'tax_amount']    
-    if simple == True:    
-        naan_drop_columns = ['tax_value', 'sq_feet']    
-    else:
-        naan_drop_columns = ['tax_value', 'sq_feet', 'bath_adv', 'lot_size', 'year_built']
-    
-    # drop naans based on the columns identified above
-    df = df.dropna(subset = naan_drop_columns)
-
-    return df
-
-
-#######         cast columns as int          #######
-
-def columns_to_int(df, simple=True):
-
-    if simple==True:
-        # recasts columns named as integers
-        df['bedrooms'] = df['bedrooms'].astype(int) 
-        df['baths'] = df['baths'].astype(int)
-        df['fips'] = df['fips'].astype(int)
-        df['tax_value'] = df['tax_value'].astype(int)
-        df['sq_feet'] = df['sq_feet'].astype(int)
-
-    else:
-        # recasts columns named as integers
-        df['bedrooms'] = df['bedrooms'].astype(int) 
-        df['bath_adv'] = df['bath_adv'].astype(int)
-        df['fips'] = df['fips'].astype(int)
-        df['tax_value'] = df['tax_value'].astype(int)
-        df['sq_feet'] = df['sq_feet'].astype(int)
-        df['lot_size'] = df['lot_size'].astype(int)
-        df['year_built'] = df['year_built'].astype(int)
-    
-    # way to cast all column elements as integers
-    #df[(list(df.columns))].astype(int) 
-     
-    return df
-
-
-#######################################################
-#######        calls  cleaning functions        #######
-#######################################################
-
-def cleaning(df, simple=True):
-    # runs functions defined earlier in program which clean up dataframe    
-    if simple==True:
-        df = rename_columns(df)
-        df = deal_with_nulls(df)
-        df = columns_to_int(df)    
-        df = handle_outliers(df)
-
-    else:
-        df = rename_columns(df, simple=False)
-        df = deal_with_nulls(df, simple=False)
-        df = columns_to_int(df, simple=False)    
-        df = handle_outliers(df, simple=False)
-
-    return df 
-
-
-
-
-###########################################################################
-#######      Functions for Splitting Data for Machine Learning      #######
-###########################################################################
-
-##############              First Split              ##############
-
-def split(df):
+def fill_nulls(df, explore=True):
     '''
-    function to split dataframe into portions for training a model, validating the model, 
-    with the goal of ultimately testing a good model
-    ''' 
+    this function accept a zillow data frame as a parameter
+    makes the following changes to the columns:
+    - fills null values with 0 for the columns where it is reasonable
+    - renames columns to human readable format
+    - removes columns where too many null values, replacing is not logical, 
+        too many or only one categorical variable(s), 
+        columns that are identical to other columns
+    in total:
+        - in 10 columns null values were replaced with 0
+        - 13 columns were dropped
+    '''
+    # potentially to be dropped because of the high # of NaN values:
+    # those columns I don't fill with nulls
+    # finishedfloor1squarefeet, finishedsquarefeet50, finishedsquarefeet6, poolsizesum, propertyzoningdesc
+    # yardbuildingsqft17, yardbuildingsqft26, fireplaceflag, taxdelinquencyflag, airconditioningdesc
+    # architecturalstyledesc, storydesc, typeconstructiondesc
+
+    # replace NaN with zeros
+    #df['pools'] = df.pools.replace({np.NAN:0})
+    #df.basementsqft = df.basementsqft.fillna(0) has 52K+ null values
+
+    if explore==True:
+        df.fireplace = df.fireplace.fillna(0)
+        df.fullbath = df.fullbath.fillna(0)
+        df.garage = df.garage.fillna(0)
+        df.garage_sqft = df.garage_sqft.fillna(0)
+        df.hottub_spa = df.hottub_spa.fillna(0)
+        df.pool = df.pool.fillna(0)
+        df.pool_10 = df.pool_10.fillna(0)
+        df.pool_2 = df.pool_2.fillna(0)
+        df.pool_7 = df.pool_7.fillna(0)
+        df.unit = df.unit.fillna(0)
+        #df.heatingorsystemdesc = df.heatingorsystemdesc.fillna('None') # check if it is ok
+
+    return df
+
+
+'''
+I am not sure where this artifact should be located so I am leaving it here.
+
+# too many  or 1 categorical unique values or identical to other columns
+df.drop(columns=['calculatedbathnbr', 'basementsqft', 'finishedsquarefeet12',
+                'rawcensustractandblock', 
+                'regionidcounty', 'regionidneighborhood', 'roomcnt', 'unitcnt',
+                'censustractandblock', 'assessmentyear', 'transactiondate',
+                'propertylandusedesc', 'heatingorsystemdesc'], 
+        inplace=True)
+# drop fullbath as almost identical to bathcount
+df.drop(columns='fullbath', inplace=True)
+'''
+
+
+############       drop null from columns       ############
+
+def drop_nulls(df, prop_required_column=0.75, prop_required_row=0.75):
+    '''
+    - the function accepts a zillo data frame,
+    percentage of min values in columns and rows 
+    - drops duplicates
+    - drops columns pool_10, pool_2, pool_7
+    - drops all columns and rows where the number of nulls is way too big
+    - drops other nulls
+    in total drops: 19 columns and 1521 rows
+    '''
+    df.drop_duplicates(inplace=True)
     
-    # splits data into two groups, holding the test variable to the side
-    train_validate, test = train_test_split(df, test_size = 0.2)
+    # assign 1 to pools where pool_10=1 and pool=0
+    df.pool = np.where((df.pool == 0) & (df.pool_10 == 1), 1, df.pool)
+    df.drop(columns=['pool_10', 'pool_2', 'pool_7'], inplace=True)
     
-    # splits train_validate into two groups, train and validate
-    train, validate = train_test_split(train_validate, test_size = 0.3)
+    prop_null_column = 1 - prop_required_column
     
-    # returns train, validate, and test variables
+    for col in list(df.columns):
+        
+        null_sum = df[col].isna().sum()
+        null_pct = null_sum / df.shape[0]
+        
+        if null_pct > prop_null_column:
+            df.drop(columns=col, inplace=True)
+            
+    row_threshold = int(prop_required_row * df.shape[1])
+    
+    df.dropna(axis=0, thresh=row_threshold, inplace=True)
+    df.dropna(axis=0, inplace=True)
+    
+    return df     
+
+
+#######       handle outliers       #######
+
+def handle_outliers(df, explore=True):
+    '''
+    the function accepts a zillow data frame as a parameter
+    returns a data frame without some outliers
+    in total removes 1208 rows
+    '''
+    if explore==True:
+        # zip code out of max range
+        df = df[df.zip <= 99_950]
+        # remove bedrooms and bathrooms > 0 and < 7
+        df = df[df.bath != 0]
+        df = df[df.beds != 0]
+        df = df[df.beds < 7]
+        df = df[df.bath < 7]
+        # remove sq feet below 300 and above 6_000
+        df = df[df.sqft >= 300]
+        df = df[df.sqft <= 6_000]
+
+        # target variable
+        # removes logerror < -0.55 and > 0.55
+        q1 = - 0.55
+        q3 = 0.55
+        #q1 = df.logerror.quantile(0.01)
+        #q3 = df.logerror.quantile(0.99)
+        df = df[(df.logerror > q1) & (df.logerror < q3)] # removes 1034 rows
+
+        # removes observations which have duplex and triplex buildings on them
+        # 18 total units are removed from sample
+        df = df[df.unit != 2]
+        df = df[df.unit != 3]
+
+        # drops 'unit' column because it doesn't help us further
+        df.drop(columns='unit', inplace=True)
+
+    return df
+
+
+#######       transform columns       #######
+
+def transform_columns(df):
+    '''
+    the function accept zillow data frame as a parameter
+    transforms:
+    --> most of floats (exc tax amout and logerror) into integer
+    --> columns with small numerical values - to 'uint8' data type
+    --> county_land_code and fips to categories
+    returns a data frame with transformed values
+    '''
+    
+    # change floats to ints
+    for col in df.iloc[:, :-3].columns:
+        if df[col].dtype != 'object':
+            df[col] = df[col].astype(int)
+
+    # create a list of numerical columns
+    numerical_columns = ['sqft', 'garage_sqft', 'latitude', 'longitude', 
+                    'lot_sqft', 'year_built', 'city_id', 'zip',
+                    'structure_price', 'price', 'land_price', 
+                    'tax_amount', 'logerror']
+    # change not numerical columns to categories
+    for col in df.columns:
+        if col not in numerical_columns:
+            if col in ['county_land_code','fips','transactiondate','propertylandusedesc']:
+                df[col] = pd.Categorical(df[col])
+            else:
+                df[col] = df[col].astype('uint8')
+    
+    return df
+
+
+#######       engineering columns in dataframe       #######
+
+def engineering(df):
+    '''
+    the function accepts zillow data frame as a parameter
+    creates a new column age = 2017 - year_built
+    creates a new column bed_bath_ratio = bed / bath
+    creates a new column count_name based on fips
+    rearranges the order of columns
+    '''
+    df['age'] = 2017 - df.year_built
+    df['bed_bath_ratio'] = round(df.beds / df.bath, 2)
+    #df['acres'] = df.lot_sqft/43560
+
+    df['county_land_code'] = df.county_land_code.replace({'010G':'0106', '010M':'0107'})
+    df['county_land_code'] = df['county_land_code'].astype(int)
+    
+    # add a new column with county names
+    df['county_name'] = np.select([((df.fips == 6037) & (df['city_id'] == 12447)),((df.fips == 6037) & (df['city_id'] != 12447)), (df.fips == 6059), (df.fips == 6111)],
+                         ['LA_city', 'LA', 'Orange', 'Ventura'])
+    # create column county_number to help with clustering
+    df['county_number']=df.county_name.map({'LA':0, 'LA_city':1, 'Ventura':2, 'Orange':3})
+    #df['la_city'] = df['city_id'].apply(lambda x: 1 if x == 12447 else 0)
+    df['county_number'] = df['county_number'].astype('uint8')
+    #df['la_city'] = df['la_city'].astype('uint8')
+    
+    df.drop(columns=['year_built', 'fips'], inplace=True)
+    # column to category data type
+   
+    new_order_cols = ['sqft',  'garage_sqft', 'lot_sqft', 'age', 
+        'structure_price', 'price','land_price', 'tax_amount', 
+        'bath', 'beds', 'bed_bath_ratio', 'city_id', 'zip', 'latitude', 'longitude',
+        'fireplace', 'garage', 'hottub_spa', 'pool', 
+        'county_land_code', 'county_number', 'county_name', 'logerror']
+    return df[new_order_cols]
+
+
+
+
+########### bins for exploration ######
+
+def add_bins(df):
+    df['age_bins'] = pd.cut(df.age, bins=[0, 20, 40, 60, 80, 100, 130])
+    df.age_bins = df.age_bins.astype(str)
+    df['log_bins'] = pd.cut(df.logerror, bins=[-0.55, -0.25, 0, 0.25, 0.55])
+    return df
+
+############### SPLIT FUCNTIONS ########
+def split_zillow(df):
+    '''
+    This function takes in a dataframe and splits it into 3 data sets
+    Test is 20% of the original dataset, validate is .30*.80= 24% of the 
+    original dataset, and train is .70*.80= 56% of the original dataset. 
+    The function returns, in this order, train, validate and test dataframes. 
+    '''
+    #split_db class verision with random seed
+    train_validate, test = train_test_split(df, test_size=0.2, 
+                                            random_state=seed)
+    train, validate = train_test_split(train_validate, test_size=0.3, 
+                                       random_state=seed)
     return train, validate, test
 
-
-
-##############              Second Split              ##############
-
-def x_y(df, target):
+def full_split_zillow(df):
     '''
-    This function depends on the split function, being handed a dataframe
-    and the target variable we are seeking to understand through prediction
+    the function accepts a zillow data frame a 
     '''
-
-    # calls split function to produce required variables
-    train, validate, test = split(df)
-
-    x_train = train.drop(columns=[target])
+    train, validate, test = split_zillow(df)
+    #save target column
     y_train = train[target]
-    
-    x_validate = validate.drop(columns=[target])
     y_validate = validate[target]
-    
-    x_test = test.drop(columns=[target])
     y_test = test[target]
+
+    #remove target column from the sets
+    train.drop(columns = target, inplace=True)
+    validate.drop(columns = target, inplace=True)
+    test.drop(columns = target, inplace=True)
+
+    return train, validate, test, y_train, y_validate, y_test
+
+##### scaling #####
+def standard_scale_zillow(train, validate, test, clustering = False, counties=False):
+    '''
+    accepts train, validate, test data sets
+    scales the data in each of them
+    returns transformed data sets
+    '''
+    if clustering:
+        col = train.iloc[:, :11].columns.tolist()
+    if counties:
+        col = train.iloc[:, :-1].columns.tolist()
+    else:
+        col = ['garage_sqft','age','beds',
+                                'garage','fireplace','bath',\
+                                'bed_bath_ratio', 'lot_sqft','tax_amount']
     
-    return x_train, y_train, x_validate, y_validate, x_test, y_test
+    # create scalers
+    scaler = StandardScaler()    
+    #qt = QuantileTransformer(output_distribution='normal')
+    scaler.fit(train[col])
+    train[col] = scaler.transform(train[col])
+    validate[col] = scaler.transform(validate[col])
+    test[col] = scaler.transform(test[col])
+    
+    return train, validate, test
+
+def standard_scale_one_df(train):
+    '''
+    scales one data frame to make clustering observations
+    '''
+    col = train.iloc[:, :11].columns.tolist()
+    
+    # create scalers
+    scaler = StandardScaler()    
+    #qt = QuantileTransformer(output_distribution='normal')
+    scaler.fit(train[col])
+    train[col] = scaler.transform(train[col])
+    return train
+
+########## create dummies before modeling #######
+def dummies(df):
+    '''
+    create dummy variables for LA and Ventura
+    '''
+    # create dummies for LA and Ventura
+    df['Orange'] = np.where(df.county_name == 'Orange', 1, 0)
+    df['Ventura'] = np.where(df.county_name == 'Ventura', 1, 0)
+    df['LA'] = np.where(df.county_name == 'LA', 1, 0)
+    return df.drop(columns='county_name')
+
+############ printing functions ###########
+
+def null_counter(df):
+    new_columns = ['name', 'num_rows_missing', 'pct_rows_missing']
+    new_df = pd.DataFrame(columns=new_columns)
+    for i, col in enumerate(list(df.columns)):
+        num_missing = df[col].isna().sum()
+        pct_missing = num_missing / df.shape[0]
+        
+        new_df.loc[i] = [col, num_missing, pct_missing]
+    
+    return new_df
+
+def print_value_counts(df):
+    for col in df.columns.tolist():
+        print(col)
+        display(df[col].value_counts(dropna=False).reset_index())
+        print()
+
