@@ -194,7 +194,7 @@ def rename_columns(df, explore=True):
 
         df.rename(columns={
                 'calculatedfinishedsquarefeet':'sqft',
-                'bathroomcnt':'bath',
+                'bathroomcnt':'baths',
                 'bedroomcnt':'beds',
                 'fireplacecnt':'fireplace',
                 'fullbathcnt':'fullbath',
@@ -325,10 +325,10 @@ def handle_outliers(df, explore=True):
         # zip code out of max range
         df = df[df.zip <= 99_950]
         # remove bedrooms and bathrooms > 0 and < 7
-        df = df[df.bath != 0]
+        df = df[df.baths != 0]
         df = df[df.beds != 0]
         df = df[df.beds < 7]
-        df = df[df.bath < 7]
+        df = df[df.baths < 7]
         # remove sq feet below 300 and above 6_000
         df = df[df.sqft >= 300]
         df = df[df.sqft <= 6_000]
